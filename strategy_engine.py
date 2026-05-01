@@ -5,11 +5,17 @@ import numpy as np
 
 fastf1.Cache.enable_cache('f1_cache')
 
-PIT_STOP_DELTA = 22
+def calculate_pit_delta(laps):
+    pit_laps = laps[laps['PitInTime'].notna() & laps['PitOutTime'].notna()].copy()
+    if len(pit_laps) == 0:
+        return 22
+    pit_laps['PitDelta'] = (pit_laps['PitOutTime'] - pit_laps['PitInTime']).dt.total_seconds()
+    pit_laps = pit_laps[(pit_laps['PitDelta'] > 15) & (pit_laps['PitDelta'] < 35)]
+    return round(pit_laps['PitDelta'].median(), 1)
 
 def get_conversational_recommendation(current_lap, total_laps, current_compound,
                                        tyre_age, position, gap_ahead, gap_behind,
-                                       recommendations, safe_to_pit, deg_rates):
+                                       recommendations, safe_to_pit, deg_rates, pit_stop_delta):
     best = recommendations[0]
     laps_remaining = total_laps - current_lap
 
@@ -25,7 +31,7 @@ def get_conversational_recommendation(current_lap, total_laps, current_compound,
     if safe_to_pit:
         msg = f"Box this lap for {compound}s. You have {gap_behind}s behind so you'll come out clean, and it saves you {cost_saving}s over the alternative."
     else:
-        time_behind = round(PIT_STOP_DELTA - gap_behind, 1)
+        time_behind = round(pit_stop_delta - gap_behind, 1)
         deg_advantage = round(deg_rates[current_compound] * tyre_age, 2)
         laps_to_catch = round(time_behind / deg_advantage) if deg_advantage > 0 else '?'
         msg = f"Pit for {compound}s despite the tight gap — you'll rejoin {time_behind}s behind but gain {deg_advantage}s/lap on fresher rubber, catching back up in ~{laps_to_catch} laps with {laps_remaining} still to go."
@@ -37,6 +43,7 @@ def get_conversational_recommendation(current_lap, total_laps, current_compound,
 
 def load_multiple_races(track, years=[2022, 2023, 2024]):
     all_laps = []
+    total_laps = None
     for year in years:
         try:
             session = fastf1.get_session(year, track, 'R')
@@ -44,10 +51,12 @@ def load_multiple_races(track, years=[2022, 2023, 2024]):
             laps = session.laps.copy()
             laps['Year'] = year
             all_laps.append(laps)
+            if total_laps is None:
+                total_laps = int(laps['LapNumber'].max())
             print(f"Loaded {year} {track}")
         except Exception as e:
             print(f"Could not load {year} {track}: {e}")
-    return pd.concat(all_laps, ignore_index=True)
+    return pd.concat(all_laps, ignore_index=True), total_laps
 
 def clean_laps(laps, compound, max_tyre_life=25):
     df = laps[
@@ -78,7 +87,7 @@ def get_deg_rate_lr(laps, compound):
         return None
     return round(np.median(stint_rates), 3)
 
-def calculate_stint_cost(compound, num_laps, deg_rates, current_tyre_age=0):
+def calculate_stint_cost(compound, num_laps, deg_rates, pit_stop_delta, current_tyre_age=0):
     rate = deg_rates.get(compound, 0)
     if not rate:
         return 0
@@ -87,13 +96,13 @@ def calculate_stint_cost(compound, num_laps, deg_rates, current_tyre_age=0):
         total_cost += rate * (current_tyre_age + lap)
     return round(total_cost, 2)
 
-def check_pit_window(gap_behind, gap_ahead, pit_stop_delta=22):
+def check_pit_window(gap_behind, gap_ahead, pit_stop_delta):
     safe_to_pit = gap_behind > pit_stop_delta
     undercut_possible = gap_ahead < 3.0
     return safe_to_pit, undercut_possible
 
 def recommend_strategy(current_lap, total_laps, current_compound,
-                       tyre_age, position, gap_ahead, gap_behind, deg_rates):
+                       tyre_age, position, gap_ahead, gap_behind, deg_rates, pit_stop_delta):
 
     laps_remaining = total_laps - current_lap
     MIN_STINT_LENGTH = 10
@@ -106,7 +115,7 @@ def recommend_strategy(current_lap, total_laps, current_compound,
 
     recommendations = []
 
-    stay_out_cost = calculate_stint_cost(current_compound, laps_remaining, deg_rates, tyre_age)
+    stay_out_cost = calculate_stint_cost(current_compound, laps_remaining, deg_rates, pit_stop_delta, tyre_age)
     recommendations.append({
         'option': 'STAY OUT',
         'compound': current_compound,
@@ -117,7 +126,7 @@ def recommend_strategy(current_lap, total_laps, current_compound,
     for compound in ['SOFT', 'MEDIUM', 'HARD']:
         if compound == current_compound:
             continue
-        pit_cost = PIT_STOP_DELTA + calculate_stint_cost(compound, laps_remaining, deg_rates, 0)
+        pit_cost = pit_stop_delta + calculate_stint_cost(compound, laps_remaining, deg_rates, pit_stop_delta, 0)
         recommendations.append({
             'option': f'PIT FOR {compound}',
             'compound': compound,
@@ -133,11 +142,12 @@ def recommend_strategy(current_lap, total_laps, current_compound,
         print(f"\n🏁 Final stint — {laps_remaining} laps to go, stay out and bring it home.")
         return
 
-    safe_to_pit, undercut_possible = check_pit_window(gap_behind, gap_ahead)
+    safe_to_pit, undercut_possible = check_pit_window(gap_behind, gap_ahead, pit_stop_delta)
 
     print(f"\n--- Strategy Report: Lap {current_lap}/{total_laps} ---")
     print(f"Current: P{position} on {current_compound} (age: {tyre_age} laps)")
     print(f"Gap ahead: {gap_ahead}s | Gap behind: {gap_behind}s")
+    print(f"Pit delta at this track: {pit_stop_delta}s")
     print(f"\nOptions (best to worst):")
     for i, rec in enumerate(recommendations):
         marker = " ← RECOMMENDED" if i == 0 else ""
@@ -146,39 +156,38 @@ def recommend_strategy(current_lap, total_laps, current_compound,
     if undercut_possible and recommendations[0]['option'] != 'STAY OUT':
         print(f"\n⚠️  Undercut opportunity! {gap_ahead}s to car ahead — pit now and you may come out ahead on fresh tyres")
 
-    if not safe_to_pit:
+    if not safe_to_pit and recommendations[0]['option'] != 'STAY OUT':
         best_pit = next((r for r in recommendations if r['option'] != 'STAY OUT'), None)
         if best_pit:
-            time_behind_after_pit = PIT_STOP_DELTA - gap_behind
+            time_behind_after_pit = pit_stop_delta - gap_behind
             deg_advantage_per_lap = deg_rates[current_compound] * tyre_age
             laps_to_catch = round(time_behind_after_pit / deg_advantage_per_lap) if deg_advantage_per_lap > 0 else '?'
             print(f"\n⚠️  Risky pit! You'd rejoin ~{time_behind_after_pit:.1f}s behind the car behind.")
             print(f"   On fresh tyres you'd gain ~{deg_advantage_per_lap:.2f}s/lap — catching back up in ~{laps_to_catch} laps")
-    else:
+    elif safe_to_pit:
         print(f"\n✅  Safe pit window — {gap_behind}s gap behind is enough to cover the stop")
 
     print(f"\n🏎️  Strategist says:")
     print(get_conversational_recommendation(current_lap, total_laps, current_compound,
                                              tyre_age, position, gap_ahead, gap_behind,
-                                             recommendations, safe_to_pit, deg_rates))
+                                             recommendations, safe_to_pit, deg_rates, pit_stop_delta))
 
 def get_user_inputs():
     print("\n🏎️  F1 Strategy Engine")
     print("=" * 30)
-    track = input("Track name (e.g. Bahrain): ").strip()
+    track = input("Track name (e.g. Bahrain, Monza, Silverstone): ").strip()
     current_lap = int(input("Current lap: "))
-    total_laps = int(input("Total laps: "))
     current_compound = input("Current compound (SOFT/MEDIUM/HARD): ").strip().upper()
     tyre_age = int(input("Tyre age (laps): "))
     position = int(input("Current position: "))
     gap_ahead = float(input("Gap to car ahead (seconds, 0 if leading): "))
     gap_behind = float(input("Gap to car behind (seconds, 0 if last): "))
-    return track, current_lap, total_laps, current_compound, tyre_age, position, gap_ahead, gap_behind
+    return track, current_lap, current_compound, tyre_age, position, gap_ahead, gap_behind
 
 # --- main ---
-track, current_lap, total_laps, current_compound, tyre_age, position, gap_ahead, gap_behind = get_user_inputs()
+track, current_lap, current_compound, tyre_age, position, gap_ahead, gap_behind = get_user_inputs()
 
-laps = load_multiple_races(track)
+laps, total_laps = load_multiple_races(track)
 
 deg_rates = {
     'SOFT': get_deg_rate_lr(laps, 'SOFT'),
@@ -186,7 +195,11 @@ deg_rates = {
     'HARD': get_deg_rate_lr(laps, 'HARD')
 }
 
-print(f"\nDeg rates: {deg_rates}")
+pit_stop_delta = calculate_pit_delta(laps)
+
+print(f"\n📍 {track} Grand Prix — {total_laps} laps total")
+print(f"Deg rates: {deg_rates}")
+print(f"Pit delta: {pit_stop_delta}s")
 
 recommend_strategy(
     current_lap=current_lap,
@@ -196,5 +209,6 @@ recommend_strategy(
     position=position,
     gap_ahead=gap_ahead,
     gap_behind=gap_behind,
-    deg_rates=deg_rates
+    deg_rates=deg_rates,
+    pit_stop_delta=pit_stop_delta
 )
